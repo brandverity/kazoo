@@ -18,6 +18,10 @@ import select
 import socket
 import threading
 import time
+import six
+
+from collections import defaultdict
+from itertools import chain
 
 import kazoo.python2atexit as python2atexit
 
@@ -32,6 +36,27 @@ from kazoo.handlers import utils
 _STOP = object()
 
 log = logging.getLogger(__name__)
+
+_HAS_EPOLL = hasattr(select, "epoll")
+
+
+def _to_fileno(obj):
+    if isinstance(obj, six.integer_types):
+        fd = int(obj)
+    elif hasattr(obj, "fileno"):
+        fd = obj.fileno()
+        if not isinstance(fd, six.integer_types):
+            raise TypeError("fileno() returned a non-integer")
+        fd = int(fd)
+    else:
+        raise TypeError("argument must be an int, or have a fileno() method.")
+
+    if fd < 0:
+        raise ValueError(
+            "file descriptor cannot be a negative integer (%d)" % (fd,)
+        )
+
+    return fd
 
 
 class KazooTimeoutError(Exception):
@@ -143,17 +168,82 @@ class SequentialThreadingHandler(object):
             python2atexit.unregister(self.stop)
 
     def select(self, *args, **kwargs):
+        # if we have epoll, and select is not expected to work
+        # use an epoll-based "select". Otherwise don't touch
+        # anything to minimize changes
+        if _HAS_EPOLL:
+            # if the highest fd we've seen is > 1023
+            if max(map(_to_fileno, chain(*args[:3]))) > 1023:
+                return self._epoll_select(*args, **kwargs)
+        return self._select(*args, **kwargs)
+
+    def _select(self, *args, **kwargs):
+        timeout = kwargs.pop('timeout', None)
+        # either the time to give up, or None
+        end = (time.time() + timeout) if timeout else None
+        while end is None or time.time() < end:
+            if end is not None:
+                # make a list, since tuples aren't mutable
+                args = list(args)
+
+                # set the timeout to the remaining time
+                args[3] = end - time.time()
+            try:
+                return select.select(*args, **kwargs)
+            except select.error as ex:
+                # if the system call was interrupted, we'll retry until timeout
+                # in Python 3, system call interruptions are a native exception
+                # in Python 2, they are not
+                errnum = ex.errno if isinstance(ex, OSError) else ex[0]
+                if errnum == errno.EINTR:
+                    continue
+                raise
+        # if we hit our timeout, lets return as a timeout
+        return ([], [], [])
+
+    def _epoll_select(self, rlist, wlist, xlist, timeout=None):
+        """epoll-based drop-in replacement for select to overcome select
+        limitation on a maximum filehandle value
+        """
+        if timeout is None:
+            timeout = -1
+        eventmasks = defaultdict(int)
+        rfd2obj = defaultdict(list)
+        wfd2obj = defaultdict(list)
+        xfd2obj = defaultdict(list)
+        read_evmask = select.EPOLLIN | select.EPOLLPRI  # Just in case
+
+        def store_evmasks(obj_list, evmask, fd2obj):
+            for obj in obj_list:
+                fileno = _to_fileno(obj)
+                eventmasks[fileno] |= evmask
+                fd2obj[fileno].append(obj)
+
+        store_evmasks(rlist, read_evmask, rfd2obj)
+        store_evmasks(wlist, select.EPOLLOUT, wfd2obj)
+        store_evmasks(xlist, select.EPOLLERR, xfd2obj)
+
+        poller = select.epoll()
+
+        for fileno in eventmasks:
+            poller.register(fileno, eventmasks[fileno])
+
         try:
-            return select.select(*args, **kwargs)
-        except select.error as ex:
-            # if the system call was interrupted, we'll return as a timeout
-            # in Python 3, system call interruptions are a native exception
-            # in Python 2, they are not
-            errnum = ex.errno if isinstance(ex, OSError) else ex[0]
-            # to mimic a timeout, we return the same thing select would
-            if errnum == errno.EINTR:
-                return ([], [], [])
-            raise
+            events = poller.poll(timeout)
+            revents = []
+            wevents = []
+            xevents = []
+            for fileno, event in events:
+                if event & read_evmask:
+                    revents += rfd2obj.get(fileno, [])
+                if event & select.EPOLLOUT:
+                    wevents += wfd2obj.get(fileno, [])
+                if event & select.EPOLLERR:
+                    xevents += xfd2obj.get(fileno, [])
+        finally:
+            poller.close()
+
+        return revents, wevents, xevents
 
     def socket(self):
         return utils.create_tcp_socket(socket)

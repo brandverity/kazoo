@@ -26,6 +26,7 @@ from kazoo.protocol.serialization import (
     Ping,
     PingInstance,
     ReplyHeader,
+    SetWatches,
     Transaction,
     Watch,
     int_struct
@@ -59,6 +60,7 @@ CHILD_EVENT = 4
 WATCH_XID = -1
 PING_XID = -2
 AUTH_XID = -4
+SET_WATCHES_XID = -8
 
 CLOSE_RESPONSE = Close.type
 
@@ -338,8 +340,10 @@ class ConnectionHandler(object):
         if header.zxid and header.zxid > 0:
             client.last_zxid = header.zxid
         if header.xid != xid:
-            raise RuntimeError('xids do not match, expected %r '
+            exc = RuntimeError('xids do not match, expected %r '
                                'received %r', xid, header.xid)
+            async_object.set_exception(exc)
+            raise exc
 
         # Determine if its an exists request and a no node error
         exists_error = (header.err == NoNodeError.code and
@@ -406,6 +410,8 @@ class ConnectionHandler(object):
                 async_object.set(True)
         elif header.xid == WATCH_XID:
             self._read_watch_event(buffer, offset)
+        elif header.xid == SET_WATCHES_XID:
+            self.logger.log(BLATHER, 'Received SetWatches reply')
         else:
             self.logger.log(BLATHER, 'Reading for header %r', header)
 
@@ -438,8 +444,10 @@ class ConnectionHandler(object):
         # Special case for auth packets
         if request.type == Auth.type:
             xid = AUTH_XID
+        elif request.type == SetWatches.type:
+            xid = SET_WATCHES_XID
         else:
-            self._xid += 1
+            self._xid = (self._xid % 2147483647) + 1
             xid = self._xid
 
         self._submit(request, connect_timeout, xid)
@@ -478,10 +486,32 @@ class ConnectionHandler(object):
             self.client._session_callback(KeeperState.CLOSED)
             self.logger.log(BLATHER, 'Connection stopped')
 
+    def _expand_client_hosts(self):
+        # Expand the entire list in advance so we can randomize it if needed
+        host_ports = []
+        for host, port in self.client.hosts:
+            try:
+                for rhost in socket.getaddrinfo(host.strip(), port, 0, 0,
+                                                socket.IPPROTO_TCP):
+                    host_ports.append((rhost[4][0], rhost[4][1]))
+            except socket.gaierror as e:
+                # Skip hosts that don't resolve
+                self.logger.warning("Cannot resolve %s: %s", host.strip(), e)
+                pass
+        if self.client.randomize_hosts:
+            random.shuffle(host_ports)
+        return host_ports
+
     def _connect_loop(self, retry):
         # Iterate through the hosts a full cycle before starting over
         status = None
-        for host, port in self.client.hosts:
+        host_ports = self._expand_client_hosts()
+
+        # Check for an empty hostlist, indicating none resolved
+        if len(host_ports) == 0:
+            return STOP_CONNECTING
+
+        for host, port in host_ports:
             if self.client._stopped.is_set():
                 status = STOP_CONNECTING
                 break
@@ -589,6 +619,11 @@ class ConnectionHandler(object):
                           client._session_id or 0, client._session_passwd,
                           client.read_only)
 
+        # save the client's last_zxid before it gets overwritten by the
+        # server's.
+        # we'll need this to reset watches via SetWatches further below.
+        last_zxid = client.last_zxid
+
         connect_result, zxid = self._invoke(
             client._session_timeout / 1000.0, connect)
 
@@ -627,4 +662,16 @@ class ConnectionHandler(object):
             zxid = self._invoke(connect_timeout / 1000.0, ap, xid=AUTH_XID)
             if zxid:
                 client.last_zxid = zxid
+
+        # TODO: separate exist from data watches
+        if client._data_watchers or client._child_watchers.keys():
+            sw = SetWatches(last_zxid,
+                            client._data_watchers.keys(),
+                            client._data_watchers.keys(),
+                            client._child_watchers.keys())
+            zxid = self._invoke(connect_timeout / 1000.0, sw,
+                                xid=SET_WATCHES_XID)
+            if zxid:
+                client.last_zxid = zxid
+
         return read_timeout, connect_timeout
